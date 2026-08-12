@@ -58,6 +58,9 @@ pub struct Optimizer {
 impl Optimizer {
   /// Create a new optimizer from a learned manifold.
   ///
+  /// This is a convenience method that always normalizes the embedding.
+  /// For more control, use `new_with_normalize`.
+  ///
   /// This performs preprocessing:
   /// - Filters weak edges from the graph
   /// - Extracts head/tail edge lists
@@ -77,6 +80,33 @@ impl Optimizer {
     total_epochs: usize,
     opt_params: &UmapConfig,
     metric_type: MetricType,
+  ) -> Self {
+    Self::new_with_normalize(manifold, init, total_epochs, opt_params, metric_type, true)
+  }
+
+  /// Create a new optimizer from a learned manifold.
+  ///
+  /// This performs preprocessing:
+  /// - Filters weak edges from the graph
+  /// - Extracts head/tail edge lists
+  /// - Computes epoch sampling schedules
+  /// - Normalizes the initial embedding (controlled by normalize_init parameter)
+  ///
+  /// # Arguments
+  ///
+  /// * `manifold` - The learned manifold structure
+  /// * `init` - Initial embedding
+  /// * `total_epochs` - Total number of epochs to run
+  /// * `opt_params` - Optimization parameters (learning rate, negative sampling, etc.)
+  /// * `metric_type` - Type of distance metric being used
+  /// * `normalize_init` - Whether to normalize the embedding to max_abs = 10.0 (default: true)
+  pub fn new_with_normalize(
+    manifold: LearnedManifold,
+    init: Array2<f32>,
+    total_epochs: usize,
+    opt_params: &UmapConfig,
+    metric_type: MetricType,
+    normalize_init: bool,
   ) -> Self {
     let gamma = opt_params.optimization.repulsion_strength;
     let initial_alpha = opt_params.optimization.learning_rate;
@@ -178,60 +208,41 @@ impl Optimizer {
       "optimizer epochs_per_sample complete"
     );
 
-    // Normalize embedding to [0, 10] range.
-    // Uses row indices + flat slice because columns aren't contiguous in row-major arrays.
+    // Normalize embedding to match Python's noisy_scale_coords behavior
+    // Python: expansion = max_coord / np.abs(coords).max()
+    //         coords = (coords * expansion)
+    // This scales the entire array so the max absolute value equals max_coord
     let started = Instant::now();
     let mut embedding = init;
-    let n_rows = embedding.shape()[0];
-    let n_dims = embedding.shape()[1];
 
-    // Compute min/max per dimension using fold/reduce (no per-row allocations)
-    let (mins, maxs) = (0..n_rows)
-      .into_par_iter()
-      .fold(
-        || (vec![f32::INFINITY; n_dims], vec![f32::NEG_INFINITY; n_dims]),
-        |(mut mins, mut maxs), i| {
-          let row = embedding.row(i);
-          for (d, &v) in row.iter().enumerate() {
-            mins[d] = mins[d].min(v);
-            maxs[d] = maxs[d].max(v);
-          }
-          (mins, maxs)
-        },
-      )
-      .reduce(
-        || (vec![f32::INFINITY; n_dims], vec![f32::NEG_INFINITY; n_dims]),
-        |(mut mins1, mut maxs1), (mins2, maxs2)| {
-          for d in 0..mins1.len() {
-            mins1[d] = mins1[d].min(mins2[d]);
-            maxs1[d] = maxs1[d].max(maxs2[d]);
-          }
-          (mins1, maxs1)
-        },
-      );
+    if normalize_init {
+      // Find the maximum absolute value in the entire embedding
+      let max_abs = embedding
+        .as_slice()
+        .unwrap()
+        .par_iter()
+        .map(|&v| v.abs())
+        .reduce(|| 0.0f32, |a, b| a.max(b));
 
-    // Compute scales
-    let scales: Vec<f32> = mins
-      .iter()
-      .zip(&maxs)
-      .map(|(&min, &max)| {
-        let range = max - min;
-        if range > 0.0 { 10.0 / range } else { 0.0 }
-      })
-      .collect();
-
-    // Apply normalization (parallel over flat array since it's contiguous)
-    let flat = embedding.as_slice_mut().unwrap();
-    flat.par_iter_mut().enumerate().for_each(|(idx, v)| {
-      let d = idx % n_dims;
-      if scales[d] > 0.0 {
-        *v = (*v - mins[d]) * scales[d];
+      // Scale so that max_abs becomes 10.0
+      if max_abs > 0.0 {
+        let scale = 10.0 / max_abs;
+        embedding.par_iter_mut().for_each(|v| {
+          *v *= scale;
+        });
       }
-    });
-    info!(
-      duration_ms = started.elapsed().as_millis(),
-      "optimizer embedding normalization complete"
-    );
+
+      info!(
+        duration_ms = started.elapsed().as_millis(),
+        max_abs, scale = if max_abs > 0.0 { 10.0 / max_abs } else { 0.0 },
+        "optimizer embedding normalization complete"
+      );
+    } else {
+      info!(
+        duration_ms = started.elapsed().as_millis(),
+        "optimizer embedding normalization skipped"
+      );
+    }
 
     // Initialize epoch scheduling (one at a time to avoid memory spike).
     // No perf loss: each array is still computed in parallel, just not allocated simultaneously.
